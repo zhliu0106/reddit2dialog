@@ -12,7 +12,7 @@ from argparse import ArgumentParser
 from bs4 import BeautifulSoup
 from os.path import join as pjoin
 from time import sleep, time
-from iopath.common.file_io import PathManager
+
 
 REDDIT_URL = "https://files.pushshift.io/reddit/"
 
@@ -81,7 +81,7 @@ def download(mode="comments"):
                     except EOFError:
                         sleep(10)
                         print("failed reading file %s file, another %d tries" % (f_name, tries_left))
-                        PathManager.rm(f_name)
+                        os.remove(f_name)
                         tries_left -= 1
             except FileNotFoundError:
                 sleep(60)

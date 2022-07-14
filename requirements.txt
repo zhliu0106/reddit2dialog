@@ -4,4 +4,4 @@ bs4
 lxml
 msgspec
 zstandard
-iopath
+tdqm

@@ -15,7 +15,8 @@ Make sure you have the following dependencies installed.
 - lxml
 - msgspec
 - zstandard
-- iopath
+- tqdm
+
 
 ```shell
 pip install -r requirements.txt

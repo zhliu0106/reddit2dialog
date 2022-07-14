@@ -11,13 +11,14 @@ import msgspec
 import os
 import gzip
 import zstandard as zstd
-from multiprocessing import Queue, Process, cpu_count
+from multiprocessing import Process, cpu_count, Queue
+
 from typing import Iterator, Dict, List
 from argparse import ArgumentParser
 from os.path import join as pjoin
 from time import time
 from utils import filter_tokenize, Comment
-
+from tqdm import tqdm
 
 def setup_args():
     """
@@ -54,64 +55,62 @@ def process():
 
             if month < 10:
                 comments_file = pjoin(input_dir, f"RC_{year}-0{month}.zst")
-                output_file = pjoin(output_dir, f"DLGS_{year}_0{month}.txt.gz")
+                output_file = pjoin(output_dir, f"DLGS_{year}_0{month}.zst")
             else:
                 comments_file = pjoin(input_dir, f"RC_{year}-{month}.zst")
-                output_file = pjoin(output_dir, f"DLGS_{year}_{month}.txt.gz")
+                output_file = pjoin(output_dir, f"DLGS_{year}_{month}.zst")
 
             num_process = max(1, cpu_count() - 1)
             maxsize = 1000 * num_process
             dict_queue = Queue(maxsize=maxsize)
             filtered_queue = Queue(maxsize=maxsize)
-            res_queue = Queue(1)
 
             # read comments
             st_time = time()
-            read_file_p = Process(target=read_file, args=(comments_file, dict_queue, num_process), daemon=True)
-            collect_leaf_p = Process(target=collect_leaf, args=(filtered_queue, res_queue), daemon=True)
-            filter_workers = []
 
+            # init data filter process
+            workers = []
             for _ in range(num_process):
                 filter_data_p = Process(target=filter_data, args=(dict_queue, filtered_queue), daemon=True)
                 filter_data_p.start()
-                filter_workers.append(filter_data_p)
+                workers.append(filter_data_p)
 
+            # init data reader process
+            read_file_p = Process(target=read_file, args=(comments_file, dict_queue, num_process), daemon=True)
             read_file_p.start()
-            collect_leaf_p.start()
+
+            # collect leaf from filtered queue
+            collected_leaf = collect_leaf(filtered_queue, num_process)
+
+            # wait for all processes to finish
             read_file_p.join()
-
-            for worker in filter_workers:
+            for worker in workers:
                 worker.join()
-
-            filtered_queue.put(None)
-            collected_leaf = res_queue.get()
-            collect_leaf_p.join()
 
             print(f"Finish reading, consuming time: {time() - st_time}")
 
             # construct trees
-            submissions = construct_trees(collected_leaf)
+            submissions, submission_num = construct_trees(collected_leaf)
 
             # construct dialogue samples and write to file
-            dlgs2write_queue = Queue(maxsize=maxsize)
-            store_sample_p = Process(target=store_sample, args=(output_file, dlgs2write_queue), daemon=True)
-            store_sample_p.start()
             construct_dlgs(
+                output_file,
                 submissions,
-                dlgs2write_queue,
+                submission_num,
                 opt["max_context_length"],
+                opt["dump_interval"],
             )
-            dlgs2write_queue.put(None)
-            store_sample_p.join()
 
 
-def read_file(comments_file: str, dict_queue: Queue, num_workers: int) -> Iterator[str]:
+def read_file(comments_file: str, dict_queue: Queue, num_workers: int):
     print(f"Start reading comments file: {comments_file}")
+
     fh = open(comments_file, "rb")
     dctx = zstd.ZstdDecompressor(max_window_size=2147483648)
     stream_reader = dctx.stream_reader(fh)
     f = io.TextIOWrapper(stream_reader, encoding="utf-8")
     decoder = msgspec.json.Decoder(Comment)
+
     st_time = time()
     for i, line in enumerate(f):
         if (i + 1) % 100000 == 0:
@@ -146,25 +145,32 @@ def filter_data(dict_queue: Queue, filtered_queue: Queue) -> None:
         if count % 10000 == 0:
             print(f"filtered {count} lines")
         filtered_queue.put([content, id, link_id, parent_id])
-
+    filtered_queue.put(None)
     print("End of filtering data")
 
 
-def collect_leaf(filtered_queue: Queue, res_queue: Queue) -> None:
+def collect_leaf(filtered_queue: Queue, num_process: int) -> None:
     leaf_list = []
+    finished_num = 0
     while True:
         data = filtered_queue.get()
         if data is None:
-            break
-        leaf_list.append(data)
-    res_queue.put(leaf_list)
+            finished_num += 1
+            if finished_num == num_process:
+                break
+        else:
+            leaf_list.append(data)
+
     print(f"End of collecting leaf")
+    return leaf_list
 
 
 def construct_trees(collected_leaf):
+    print("Start constructing trees")
     st_time = time()
     submissions = dict()
     count = 0
+    submission_num = 0
     for leaf in collected_leaf:
         count += 1
         (content, id, link_id, parent_id) = leaf
@@ -172,6 +178,7 @@ def construct_trees(collected_leaf):
             submissions[link_id][id] = (content, parent_id, id, False, False)
         else:
             submissions[link_id] = dict()
+            submission_num += 1
             submissions[link_id][id] = (content, parent_id, id, False, False)
     for link_id, submission in submissions.items():
         for id, (content, parent_id, _, has_child, responsed) in submission.items():
@@ -187,13 +194,27 @@ def construct_trees(collected_leaf):
                 else:
                     break
     print(f"End of constructing trees. found {count} leaf after filtering. consumed {time() - st_time:.2f} s")
-    return submissions
+    return submissions, submission_num
 
 
-def construct_dlgs(submissions: Dict, dlgs2write_queue: Queue, max_context_length: int = 6) -> None:
+def construct_dlgs(output_file: str, submissions: Dict, submission_num: int, max_context_length: int = 6, dump_interval: int = 2**10) -> None:
+    print("Start constructing dialogue samples")
+
+    # Record statistics data
     stats_data = {}
+
+    # init tqdm
+    pbar = tqdm(total=submission_num)
     st_time = time()
+
+    # init zstd compressor
+    f = open(output_file, "wb")
+    cctx = zstd.ZstdCompressor()
+    compressor = cctx.stream_writer(f)
+
+    count = 0
     for link_id, submission in submissions.items():
+        pbar.update(1)
         # Start building the dialogue from the leaf. Also ignore empty turns (placeholder)
         for id, (content, parent_id, _, has_child, responsed) in submission.items():
 
@@ -237,44 +258,40 @@ def construct_dlgs(submissions: Dict, dlgs2write_queue: Queue, max_context_lengt
                     "response": dlg[i],
                 }
 
-                dlgs2write_queue.put(json.dumps(dlg_obj) + "\n")
+                # write the sample to file
+                count += 1
+                line = json.dumps(dlg_obj) + "\n"
+                compressor.write(line.encode("utf-8"))
+                if count % dump_interval == 0:
+                    compressor.flush()
+
                 # set the comment (that already been response) as True
                 (content, parent_id, id, has_child, responsed) = submission[id_list[i]]
                 submission[id_list[i]] = (content, parent_id, id, has_child, True)
 
                 stats_data[i] = stats_data.get(i, 0) + 1
 
-    print(f"End of constructing dialogue samples, consumed {time() - st_time:.2f} s")
-    print(f"Final data stats: {stats_data}")
-
-
-def store_sample(output_file: str, dlgs2write_queue: Queue):
-    print(f"Start storing samples to {output_file}")
-
-    # f = open(output_file, "w", encoding="utf-8")
-    # count = 0
-    # while True:
-    #     dlg = dlgs2write_queue.get()
-    #     if dlg is None:
-    #         break
-    #     f.write(dlg)
-    #     count += 1
-    # f.close()
-
-    f = open(output_file, "wb")
-    cctx = zstd.ZstdCompressor()
-    compressor = cctx.stream_writer(f)
-    count = 0
-    while True:
-        dlg = dlgs2write_queue.get()
-        if dlg is None:
-            break
-        compressor.write(dlg.encode("utf-8"))
-        compressor.flush()
-        count += 1
+    pbar.close()
     compressor.flush(zstd.FLUSH_FRAME)
     f.close()
-    print(f"End of storing samples to {output_file}. constructed {count} samples")
+    print(f"End of constructing dialogue samples, consumed {time() - st_time:.2f} s")
+    print(f"Total {count} samples")
+    print(f"Data stats info: {stats_data}")
+
+
+def read_processed_file(filepath):
+
+    fh = open(filepath, "rb")
+    dctx = zstd.ZstdDecompressor(max_window_size=2147483648)
+    stream_reader = dctx.stream_reader(fh)
+    f = io.TextIOWrapper(stream_reader, encoding="utf-8")
+    decoder = msgspec.json.Decoder()
+
+    for i, line in enumerate(f):
+        sample = decoder.decode(line.encode("utf-8"))
+
+    fh.close()
+
 
 
 if __name__ == "__main__":
