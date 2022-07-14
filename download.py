@@ -50,7 +50,7 @@ def setup_args():
     return parser.parse_args().__dict__
 
 
-def download(mode="submissions"):
+def download(mode="comments"):
     opt = setup_args()
     output_dir = opt["output_dir"]
     reddit_tmp_dir = pjoin(output_dir, "reddit_tmp")
@@ -89,5 +89,4 @@ def download(mode="submissions"):
 
 
 if __name__ == "__main__":
-    download("submissions")
     download("comments")

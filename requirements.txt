@@ -1,0 +1,7 @@
+transformers
+requests
+bs4
+lxml
+msgspec
+zstandard
+iopath

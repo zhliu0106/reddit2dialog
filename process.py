@@ -4,7 +4,10 @@ Adapted from https://github.com/facebookresearch/ParlAI/blob/dff9aabb5024c30c81e
 """
 
 import io
+
 import json
+
+import msgspec
 import os
 import gzip
 import zstandard as zstd
@@ -13,7 +16,7 @@ from typing import Iterator, Dict, List
 from argparse import ArgumentParser
 from os.path import join as pjoin
 from time import time
-from utils import tokenize, do_filter
+from utils import filter_tokenize, Comment
 
 
 def setup_args():
@@ -28,8 +31,9 @@ def setup_args():
     reddit.add_argument("-em", "--end_month", default=5, type=int, metavar="N", help="end month")
     reddit.add_argument("-o", "--output_dir", default="res/", type=str, help="where to save the output")
 
-    reddit.add_argument("--min_dialogue_length", default=3, type=int, help="min dialogue length")
-    reddit.add_argument("--dump_interval", default=2 ** 10, type=int)
+    reddit.add_argument("--tokenizer", default="facebook/bart-large", type=str, help="tokenizer to use")
+    reddit.add_argument("--max_context_length", default=6, type=int, help="max context length")
+    reddit.add_argument("--dump_interval", default=2**10, type=int)
     return parser.parse_args().__dict__
 
 
@@ -56,33 +60,29 @@ def process():
                 output_file = pjoin(output_dir, f"DLGS_{year}_{month}.txt.gz")
 
             num_process = max(1, cpu_count() - 1)
-            maxsize = 10 * num_process
-            line_queue = Queue(maxsize=maxsize)
+            maxsize = 1000 * num_process
             dict_queue = Queue(maxsize=maxsize)
             filtered_queue = Queue(maxsize=maxsize)
             res_queue = Queue(1)
 
             # read comments
             st_time = time()
-            read_file_p = Process(target=read_file, args=(comments_file, line_queue, num_process), daemon=True)
+            read_file_p = Process(target=read_file, args=(comments_file, dict_queue, num_process), daemon=True)
             collect_leaf_p = Process(target=collect_leaf, args=(filtered_queue, res_queue), daemon=True)
-            line2dict_workers = []
             filter_workers = []
-            for _ in range(num_process):
-                line2dict_p = Process(target=line2dict, args=(line_queue, dict_queue), daemon=True)
-                line2dict_p.start()
-                line2dict_workers.append(line2dict_p)
 
+            for _ in range(num_process):
                 filter_data_p = Process(target=filter_data, args=(dict_queue, filtered_queue), daemon=True)
                 filter_data_p.start()
                 filter_workers.append(filter_data_p)
+
             read_file_p.start()
             collect_leaf_p.start()
             read_file_p.join()
-            for worker in line2dict_workers:
-                worker.join()
+
             for worker in filter_workers:
                 worker.join()
+
             filtered_queue.put(None)
             collected_leaf = res_queue.get()
             collect_leaf_p.join()
@@ -90,7 +90,7 @@ def process():
             print(f"Finish reading, consuming time: {time() - st_time}")
 
             # construct trees
-            submissions, submission2subreddit = construct_trees(collected_leaf)
+            submissions = construct_trees(collected_leaf)
 
             # construct dialogue samples and write to file
             dlgs2write_queue = Queue(maxsize=maxsize)
@@ -98,74 +98,55 @@ def process():
             store_sample_p.start()
             construct_dlgs(
                 submissions,
-                submission2subreddit,
                 dlgs2write_queue,
-                opt["min_dialogue_length"],
+                opt["max_context_length"],
             )
             dlgs2write_queue.put(None)
             store_sample_p.join()
 
 
-def read_file(comments_file: str, line_queue: Queue, num_workers: int) -> Iterator[str]:
+def read_file(comments_file: str, dict_queue: Queue, num_workers: int) -> Iterator[str]:
     print(f"Start reading comments file: {comments_file}")
     fh = open(comments_file, "rb")
     dctx = zstd.ZstdDecompressor(max_window_size=2147483648)
     stream_reader = dctx.stream_reader(fh)
     f = io.TextIOWrapper(stream_reader, encoding="utf-8")
-
+    decoder = msgspec.json.Decoder(Comment)
+    st_time = time()
     for i, line in enumerate(f):
         if (i + 1) % 100000 == 0:
-            print(f"read {i+1} lines comments")
-        line_queue.put(line)
+            print(f"read {i+1} lines comments, consuming time: {time() - st_time}")
+        parsed = decoder.decode(line.encode("utf-8"))
+        dict_queue.put(parsed)
 
     fh.close()
 
     for _ in range(num_workers):
-        line_queue.put(None)
+        dict_queue.put(None)
     print(f"End of reading. found {i} lines in total")
-
-
-def line2dict(line_queue: Queue, dict_queue: Queue) -> None:
-    print("Start processing lines")
-    count = 0
-    while True:
-        line = line_queue.get()
-        if line is None:
-            break
-        try:
-            parsed = json.loads(line)
-        except json.JSONDecodeError as e:
-            print(f"[build] Error parsing line ({str(e)})\n - {line}")
-            continue
-        count += 1
-        if count % 10000 == 0:
-            print(f"load dict {count} lines")
-        dict_queue.put(parsed)
-    dict_queue.put(None)
-    print("End of turning line to dict")
 
 
 def filter_data(dict_queue: Queue, filtered_queue: Queue) -> None:
     print("Start filtering data")
     count = 0
+
     while True:
         parsed = dict_queue.get()
         if parsed is None:
             break
-        if do_filter(parsed):
+        if filter_tokenize(parsed):
             continue
-        content, id, link_id, parent_id, subreddit = (
-            tokenize(parsed["body"]),
-            parsed["id"],
-            parsed["link_id"][3:],
-            parsed["parent_id"][3:],
-            parsed["subreddit"],
+        content, id, link_id, parent_id = (
+            parsed.body,
+            parsed.id,
+            parsed.link_id[3:],
+            parsed.parent_id[3:],
         )
         count += 1
         if count % 10000 == 0:
             print(f"filtered {count} lines")
-        filtered_queue.put([content, id, link_id, parent_id, subreddit])
-    # filtered_queue.put(None)
+        filtered_queue.put([content, id, link_id, parent_id])
+
     print("End of filtering data")
 
 
@@ -183,53 +164,52 @@ def collect_leaf(filtered_queue: Queue, res_queue: Queue) -> None:
 def construct_trees(collected_leaf):
     st_time = time()
     submissions = dict()
-    submission2subreddit = {}
     count = 0
     for leaf in collected_leaf:
         count += 1
-        (content, id, link_id, parent_id, subreddit) = leaf
+        (content, id, link_id, parent_id) = leaf
         if link_id in submissions:
-            submissions[link_id][id] = (content, parent_id, id, False)
+            submissions[link_id][id] = (content, parent_id, id, False, False)
         else:
             submissions[link_id] = dict()
-            submissions[link_id][id] = (content, parent_id, id, False)
-            submission2subreddit[link_id] = subreddit
+            submissions[link_id][id] = (content, parent_id, id, False, False)
     for link_id, submission in submissions.items():
-        for id, (content, parent_id, _, has_child) in submission.items():
+        for id, (content, parent_id, _, has_child, responsed) in submission.items():
             if has_child:
                 continue
             while True:
                 if parent_id in submission:
-                    (_content, _parent_id, _id, _has_child) = submission[parent_id]
+                    (_content, _parent_id, _id, _has_child, responsed) = submission[parent_id]
                     if _has_child:
                         break
-                    submission[parent_id] = (_content, _parent_id, _id, True)
+                    submission[parent_id] = (_content, _parent_id, _id, True, responsed)
                     parent_id = _parent_id
                 else:
                     break
     print(f"End of constructing trees. found {count} leaf after filtering. consumed {time() - st_time:.2f} s")
-    return submissions, submission2subreddit
+    return submissions
 
 
-def construct_dlgs(
-    submissions: Dict, submission2subreddit: Dict, dlgs2write_queue: Queue, min_dialogue_length: int = 3
-) -> None:
+def construct_dlgs(submissions: Dict, dlgs2write_queue: Queue, max_context_length: int = 6) -> None:
     stats_data = {}
     st_time = time()
     for link_id, submission in submissions.items():
         # Start building the dialogue from the leaf. Also ignore empty turns (placeholder)
-        for id, (content, parent_id, _, has_child) in submission.items():
+        for id, (content, parent_id, _, has_child, responsed) in submission.items():
 
             if has_child:
                 continue
 
-            dlg, ids = [], []
+            dlg = []
+            id_list = []
+            responsed_list = []
             while True:
                 dlg.append(content)
-                ids.append(id)
+                id_list.append(id)
+                responsed_list.append(responsed)
                 try:
                     id = parent_id
-                    (content, parent_id, id, has_child) = submission[id]
+                    (content, parent_id, id, has_child, responsed) = submission[id]
                 except KeyError:
                     dlg = []
                 finally:
@@ -237,32 +217,32 @@ def construct_dlgs(
                         break
                     if link_id == parent_id:
                         dlg.append(content)
-                        ids.append(id)
+                        id_list.append(id)
+                        responsed_list.append(responsed)
                         break
-            # Some validation, set min dialogue length and assert not empty
-            if not dlg or len(dlg) < min_dialogue_length:
+            # Some validation, assert not empty
+            if len(dlg) < 2:
                 continue
 
-            if not ids or len(ids) != len(dlg) or not all(i.strip() for i in ids):
-                continue
+            dlg = dlg[::-1]
+            id_list = id_list[::-1]
+            responsed_list = responsed_list[::-1]
 
-            try:
-                # Lowercase the subreddit
-                subreddit = submission2subreddit[link_id].strip().lower()
-            except KeyError:
-                continue
+            # generate dialogue samples - (context, response) pair
+            for i, flag in enumerate(responsed_list[1:max_context_length+1], 1):
+                if flag:
+                    continue
+                dlg_obj = {
+                    "context": dlg[:i],
+                    "response": dlg[i],
+                }
 
-            if not subreddit:
-                continue
+                dlgs2write_queue.put(json.dumps(dlg_obj) + "\n")
+                # set the comment (that already been response) as True
+                (content, parent_id, id, has_child, responsed) = submission[id_list[i]]
+                submission[id_list[i]] = (content, parent_id, id, has_child, True)
 
-            stats_data[len(dlg)] = stats_data.get(len(dlg), 0) + 1
-
-            dlg_obj = {
-                "domain": subreddit,
-                "turns_with_ids": list(zip(ids, dlg))[::-1],
-            }
-
-            dlgs2write_queue.put(json.dumps(dlg_obj) + "\n")
+                stats_data[i] = stats_data.get(i, 0) + 1
 
     print(f"End of constructing dialogue samples, consumed {time() - st_time:.2f} s")
     print(f"Final data stats: {stats_data}")
@@ -270,15 +250,31 @@ def construct_dlgs(
 
 def store_sample(output_file: str, dlgs2write_queue: Queue):
     print(f"Start storing samples to {output_file}")
-    # f = gzip.open(output_file, "wt", encoding="utf-8")
-    f = open(output_file, "w", encoding="utf-8")
+
+    # f = open(output_file, "w", encoding="utf-8")
+    # count = 0
+    # while True:
+    #     dlg = dlgs2write_queue.get()
+    #     if dlg is None:
+    #         break
+    #     f.write(dlg)
+    #     count += 1
+    # f.close()
+
+    f = open(output_file, "wb")
+    cctx = zstd.ZstdCompressor()
+    compressor = cctx.stream_writer(f)
+    count = 0
     while True:
         dlg = dlgs2write_queue.get()
         if dlg is None:
             break
-        f.write(dlg)
+        compressor.write(dlg.encode("utf-8"))
+        compressor.flush()
+        count += 1
+    compressor.flush(zstd.FLUSH_FRAME)
     f.close()
-    print(f"End of storing samples to {output_file}")
+    print(f"End of storing samples to {output_file}. constructed {count} samples")
 
 
 if __name__ == "__main__":

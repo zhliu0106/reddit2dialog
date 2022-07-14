@@ -1,7 +1,11 @@
 import re
 import signal
+import msgspec
 from contextlib import contextmanager
-from nltk.tokenize import word_tokenize
+
+from transformers import AutoTokenizer
+
+tokenizer = AutoTokenizer.from_pretrained("facebook/bart-large")
 
 FILTERED_REDDITS = []
 with open("filtered_reddits.txt") as f:
@@ -17,6 +21,13 @@ HTML_PAIRS = [
     ("&lt;", " < "),
 ]
 
+class Comment(msgspec.Struct):
+    body: str
+    id: str
+    link_id: str
+    parent_id: str
+    subreddit: str
+    author: str
 
 class TimeoutException(Exception):
     pass
@@ -38,28 +49,27 @@ def time_limit(seconds):
 def tokenize(string):
     for a, b in HTML_PAIRS:
         string = string.replace(a, b)
-    for a in ["\n", "\r", "<", ">"]:
+    for a in ["\n", "\r", "<", ">", "``", "''", "*"]:
         string = string.replace(a, " ")
-    tokens = word_tokenize(string.strip())
+    tokens = tokenizer.tokenize(string.strip())
     res = " ".join(tokens)
     return res
 
 
-def do_filter(comment):
-    content = comment["body"]
+def filter_tokenize(comment):
+    content = comment.body
+
     if not content.strip():
         return True
-    if comment["subreddit"].lower() in FILTERED_REDDITS:
+    if comment.subreddit.lower() in FILTERED_REDDITS:
         return True
-    if comment["author"] == "AutoModerator":
+    if comment.author == "AutoModerator":
         return True
     if content in ["[removed]", "[deleted]"] or "your submission has been removed" in content.lower():
         return True
     if " " not in content and len(content) > 2048:
         return True
     if len(content) < 5:
-        return True
-    if len(word_tokenize(content)) > 128:
         return True
     if not content[0].isascii():
         return True
@@ -68,5 +78,10 @@ def do_filter(comment):
             if URL_REGEX.search(content) is not None:
                 return True
     except TimeoutException:
+        return True
+    if len(comment.body.split()) > 128:
+        return True
+    comment.body = tokenize(comment.body)
+    if len(comment.body.split()) > 128:
         return True
     return False
