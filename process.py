@@ -4,7 +4,7 @@ Adapted from https://github.com/facebookresearch/ParlAI/blob/dff9aabb5024c30c81e
 """
 
 import io
-
+import gc
 import json
 
 import msgspec
@@ -92,6 +92,10 @@ def process():
             # construct trees
             submissions, submission_num = construct_trees(collected_leaf)
 
+            # delete variable and clear memory
+            del collected_leaf
+            gc.collect()
+
             # construct dialogue samples and write to file
             construct_dlgs(
                 output_file,
@@ -100,6 +104,12 @@ def process():
                 opt["max_context_length"],
                 opt["dump_interval"],
             )
+
+            # delete variable and clear memory
+            del submissions
+            del submission_num
+            gc.collect()
+
 
 
 def read_file(comments_file: str, dict_queue: Queue, num_workers: int):
