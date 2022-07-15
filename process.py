@@ -87,6 +87,9 @@ def process():
             for worker in workers:
                 worker.join()
 
+            del dict_queue
+            del filtered_queue
+            gc.collect()
             print(f"Finish reading, consuming time: {time() - st_time}")
 
             # construct trees
