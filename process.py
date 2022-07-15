@@ -107,7 +107,6 @@ def process():
 
             # delete variable and clear memory
             del submissions
-            del submission_num
             gc.collect()
 
 
