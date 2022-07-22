@@ -5,7 +5,7 @@ from contextlib import contextmanager
 
 from transformers import AutoTokenizer
 
-tokenizer = AutoTokenizer.from_pretrained("facebook/bart-large")
+tokenizer = AutoTokenizer.from_pretrained("/data/zhliu/plm/bart-large")
 
 FILTERED_REDDITS = []
 with open("filtered_reddits.txt") as f:
@@ -46,13 +46,12 @@ def time_limit(seconds):
         signal.alarm(0)
 
 
-def tokenize(string):
+def preprocess(string):
     for a, b in HTML_PAIRS:
         string = string.replace(a, b)
     for a in ["\n", "\r", "<", ">", "``", "''", "*"]:
         string = string.replace(a, " ")
-    tokens = tokenizer.tokenize(string.strip())
-    res = " ".join(tokens)
+    res = " ".join(string.strip().split())
     return res
 
 
@@ -79,9 +78,9 @@ def filter_tokenize(comment):
                 return True
     except TimeoutException:
         return True
+    comment.body = preprocess(comment.body)
     if len(comment.body.split()) > 128:
         return True
-    comment.body = tokenize(comment.body)
-    if len(comment.body.split()) > 128:
+    if len(tokenizer.tokenize(comment.body)) > 128:
         return True
     return False

@@ -4,7 +4,7 @@ python download.py \
     -ey 2022 \
     -sm 5 \
     -em 5 \
-    -o res/
+    -o ../reddit_data/
 
 # Process
 python process.py \
@@ -12,4 +12,5 @@ python process.py \
     -ey 2022 \
     -sm 5 \
     -em 5 \
-    -o res/
+    -o ../reddit_data/ \
+    --valid_split_percentage 0.0002

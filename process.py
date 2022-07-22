@@ -32,6 +32,7 @@ def setup_args():
     reddit.add_argument("-em", "--end_month", default=5, type=int, metavar="N", help="end month")
     reddit.add_argument("-o", "--output_dir", default="res/", type=str, help="where to save the output")
 
+    reddit.add_argument("--valid_split_percentage", default=0.0002, type=float, help="The percentage of the train set used as validation set in case there's no validation split")
     reddit.add_argument("--tokenizer", default="facebook/bart-large", type=str, help="tokenizer to use")
     reddit.add_argument("--max_context_length", default=6, type=int, help="max context length")
     reddit.add_argument("--dump_interval", default=2**10, type=int)
@@ -55,10 +56,12 @@ def process():
 
             if month < 10:
                 comments_file = pjoin(input_dir, f"RC_{year}-0{month}.zst")
-                output_file = pjoin(output_dir, f"DLGS_{year}_0{month}.zst")
+                output_train_file = pjoin(output_dir, f"DLGS_{year}_0{month}.train.zst")
+                output_valid_file = pjoin(output_dir, f"DLGS_{year}_0{month}.valid.zst")
             else:
                 comments_file = pjoin(input_dir, f"RC_{year}-{month}.zst")
-                output_file = pjoin(output_dir, f"DLGS_{year}_{month}.zst")
+                output_train_file = pjoin(output_dir, f"DLGS_{year}_{month}.train.zst")
+                output_valid_file = pjoin(output_dir, f"DLGS_{year}_{month}.valid.zst")
 
             num_process = max(1, cpu_count() - 1)
             maxsize = 1000 * num_process
@@ -101,11 +104,13 @@ def process():
 
             # construct dialogue samples and write to file
             construct_dlgs(
-                output_file,
+                output_train_file,
+                output_valid_file,
                 submissions,
                 submission_num,
                 opt["max_context_length"],
                 opt["dump_interval"],
+                opt["valid_split_percentage"]
             )
 
             # delete variable and clear memory
@@ -209,7 +214,7 @@ def construct_trees(collected_leaf):
     return submissions, submission_num
 
 
-def construct_dlgs(output_file: str, submissions: Dict, submission_num: int, max_context_length: int = 6, dump_interval: int = 2**10) -> None:
+def construct_dlgs(output_train_file: str, output_valid_file: str, submissions: Dict, submission_num: int, max_context_length: int = 6, dump_interval: int = 2**10, valid_split_percentage: float = 0.0002) -> None:
     print("Start constructing dialogue samples")
 
     # Record statistics data
@@ -220,13 +225,24 @@ def construct_dlgs(output_file: str, submissions: Dict, submission_num: int, max
     st_time = time()
 
     # init zstd compressor
-    f = open(output_file, "wb")
-    cctx = zstd.ZstdCompressor()
-    compressor = cctx.stream_writer(f)
+    f_train = open(output_train_file, "wb")
+    f_valid = open(output_valid_file, "wb")
+    cctx_train = zstd.ZstdCompressor()
+    cctx_valid = zstd.ZstdCompressor()
+    compressor_train = cctx_train.stream_writer(f_train)
+    compressor_valid = cctx_valid.stream_writer(f_valid)
 
     count = 0
+    submission_count = 0
+    valid_steps = int(1/valid_split_percentage)
     for link_id, submission in submissions.items():
         pbar.update(1)
+        submission_count += 1
+        if submission_count % valid_steps == 0:
+            to_valid = True
+        else:
+            to_valid = False
+
         # Start building the dialogue from the leaf. Also ignore empty turns (placeholder)
         for id, (content, parent_id, _, has_child, responsed) in submission.items():
 
@@ -273,9 +289,13 @@ def construct_dlgs(output_file: str, submissions: Dict, submission_num: int, max
                 # write the sample to file
                 count += 1
                 line = json.dumps(dlg_obj) + "\n"
-                compressor.write(line.encode("utf-8"))
+                if to_valid:
+                    compressor_valid.write(line.encode("utf-8"))
+                else:
+                    compressor_train.write(line.encode("utf-8"))
                 if count % dump_interval == 0:
-                    compressor.flush()
+                    compressor_train.flush()
+                    compressor_valid.flush()
 
                 # set the comment (that already been response) as True
                 (content, parent_id, id, has_child, responsed) = submission[id_list[i]]
@@ -284,8 +304,10 @@ def construct_dlgs(output_file: str, submissions: Dict, submission_num: int, max
                 stats_data[i] = stats_data.get(i, 0) + 1
 
     pbar.close()
-    compressor.flush(zstd.FLUSH_FRAME)
-    f.close()
+    compressor_train.flush(zstd.FLUSH_FRAME)
+    compressor_valid.flush(zstd.FLUSH_FRAME)
+    f_train.close()
+    f_valid.close()
     print(f"End of constructing dialogue samples, consumed {time() - st_time:.2f} s")
     print(f"Total {count} samples")
     print(f"Data stats info: {stats_data}")
