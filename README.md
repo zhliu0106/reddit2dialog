@@ -36,7 +36,7 @@ python download.py \
     -ey 2022 \ #   end year
     -sm 5 \    # start month
     -em 5 \    #   end month
-    -o data_dir/
+    -o data_dir/ # output directory
 ```
 
 ### Process
@@ -49,7 +49,8 @@ python process.py \
     -ey 2022 \ #   end year
     -sm 5 \    # start month
     -em 5 \    #   end month
-    -o data_dir/
+    -o data_dir/ # output directory
+    --valid_split_percentage 0.0002 # validation dataset percentage
 ```
 
 ## Reference
