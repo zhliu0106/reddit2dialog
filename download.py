@@ -55,7 +55,7 @@ def download(mode="comments"):
     output_dir = opt["output_dir"]
     reddit_tmp_dir = pjoin(output_dir, "reddit_tmp")
     if not os.path.exists(reddit_tmp_dir):
-        os.mkdir(reddit_tmp_dir)
+        os.makedirs(reddit_tmp_dir)
 
     assert mode in ["submissions", "comments"], "mode must be either submissions or comments"
     date_to_urls = gather_dump_urls(REDDIT_URL, mode)

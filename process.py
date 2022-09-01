@@ -46,7 +46,7 @@ def process():
     output_dir = pjoin(opt["output_dir"], "processed_data")
 
     if not os.path.exists(output_dir):
-        os.mkdir(output_dir)
+        os.makedirs(output_dir)
 
     for year in range(opt["start_year"], opt["end_year"] + 1):
         st_month = opt["start_month"] if year == opt["start_year"] else 1
@@ -323,6 +323,7 @@ def read_processed_file(filepath):
 
     for i, line in enumerate(f):
         sample = decoder.decode(line.encode("utf-8"))
+        breakpoint()
 
     fh.close()
 
