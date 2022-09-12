@@ -105,6 +105,8 @@ def filter_tokenize(comment):
     except TimeoutException:
         return True
     comment.body = preprocess(comment.body)
+    if not comment.body.strip():
+        return True
     if len(comment.body.split()) > 128:
         return True
     if len(tokenizer.tokenize(comment.body)) > 128:
